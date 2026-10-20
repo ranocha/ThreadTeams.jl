@@ -52,7 +52,12 @@ case $cmd in
             ssh "$h" "test ! -f ~/$REMOTE_DIR/sweep.pid || ! kill -0 \$(cat ~/$REMOTE_DIR/sweep.pid) 2>/dev/null" ||
                 { echo "   a sweep is still running there (remote.sh stop $h)"; continue; }
             git -C "$ROOT" archive --format=tar "$ref" |
-                ssh "$h" "mkdir -p ~/$REMOTE_DIR && tar -x -C ~/$REMOTE_DIR && echo '$commit$dirty' > ~/$REMOTE_DIR/.sweep-commit"
+                ssh "$h" "mkdir -p ~/$REMOTE_DIR && tar -xm -C ~/$REMOTE_DIR && echo '$commit$dirty' > ~/$REMOTE_DIR/.sweep-commit"
+            # The EPCC sources, if fetched here, so that the host need not reach GitHub
+            for t in "$SWEEP"/.cache/epcc-*.tar.gz; do
+                [[ -s $t ]] || continue
+                ssh "$h" "mkdir -p ~/$REMOTE_DIR/benchmark/sweep/.cache && cat > ~/$REMOTE_DIR/benchmark/sweep/.cache/${t##*/}" <"$t"
+            done
             # shellcheck disable=SC2029
             # In a session of its own (if there is `setsid`), so that `stop` can end it all
             ssh "$h" "cd ~/$REMOTE_DIR || exit 1; \$(command -v setsid) nohup env$(env_args) \

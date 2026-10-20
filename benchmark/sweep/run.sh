@@ -237,14 +237,26 @@ for j in "${JULIAS[@]}"; do
 done
 
 EPCC_BINS=()
-if has epcc; then
-    src=$CACHE/epcc-$EPCC_COMMIT
-    if [[ ! -d $src ]]; then
-        log "fetching EPCC OpenMP micro-benchmarks"
-        mkdir -p "$src"
-        curl -fsSL "https://github.com/EPCCed/epcc-openmp-microbenchmarks/archive/$EPCC_COMMIT.tar.gz" |
-            tar -xz -C "$src" --strip-components=1
-    fi
+# The sources' tarball is shared by the hosts (`remote.sh` copies it along, so that a host
+# need not reach GitHub); the build is per host. Without it, the sweep runs without EPCC.
+EPCC_TAR=$SWEEP/.cache/epcc-$EPCC_COMMIT.tar.gz
+if has epcc && [[ ! -s $EPCC_TAR ]]; then
+    log "fetching EPCC OpenMP micro-benchmarks"
+    for attempt in 1 2 3; do
+        curl -fsSL -o "$EPCC_TAR.part" \
+            "https://github.com/EPCCed/epcc-openmp-microbenchmarks/archive/$EPCC_COMMIT.tar.gz" &&
+            mv "$EPCC_TAR.part" "$EPCC_TAR" && break
+        rm -f "$EPCC_TAR.part"
+        sleep 5
+    done
+    [[ -s $EPCC_TAR ]] || log "fetching EPCC failed, running without it"
+fi
+src=$CACHE/epcc-$EPCC_COMMIT
+if has epcc && [[ -s $EPCC_TAR && ! -d $src ]]; then
+    mkdir -p "$src.part" && tar -xzf "$EPCC_TAR" -C "$src.part" --strip-components=1 && mv "$src.part" "$src" ||
+        { rm -rf "$src.part"; log "unpacking EPCC failed, running without it"; }
+fi
+if has epcc && [[ -d $src ]]; then
     for cc in $EPCC_CC; do
         command -v "$cc" >/dev/null 2>&1 || { log "no $cc, skipping its OpenMP"; continue; }
         bin=$CACHE/syncbench-$cc
