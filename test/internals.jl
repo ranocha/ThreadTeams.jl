@@ -106,9 +106,11 @@ end
     @test clears("apple-m1", :aarch64, "dispatcher")
     @test !clears("cascadelake", :x86_64, "worker")
     @test (@test_logs (:warn,) clears("cascadelake", :x86_64, "both")) == true
-    # the pool reads it when it starts
-    tforeach(identity, 1:NW; scheduler = team)
-    @test ThreadTeams.DISPATCHER_CLEARS[] == ThreadTeams.SLOT_CLEARING()
+    # the pool reads it when it starts (with one thread there is no pool: loops run serially)
+    if NW > 1
+        tforeach(identity, 1:NW; scheduler = team)
+        @test ThreadTeams.DISPATCHER_CLEARS[] == ThreadTeams.SLOT_CLEARING()
+    end
 end
 
 # The slot tests below in both modes: `DISPATCHER_CLEARS` is read once per region, so it
