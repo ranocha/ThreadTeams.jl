@@ -848,8 +848,9 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
     copies = own_slots(F)
     wslots = copies ? worker_slots(F, length(pool.workers)) : worker_slot_vector(F)
     base = cmd_base(n, skip, has_scope)
-    # Whether every worker of the region is idle (also when a chunk threw)
-    drained = false
+    # Whether every worker of the region is idle (also when a chunk threw), and whether the
+    # workers' slots are empty
+    drained = cleared = false
     try
         # Decreasing chunk order: see `wake_children`
         for chunk in n:-1:2
@@ -894,8 +895,8 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
         else
             steal_chunks(pool, slot, n, skip, base)
         end
-        wait_workers(pool, 2, n, skip)
-        drained = true
+        wait_workers(pool, 2, n, skip, wslots, copies)
+        drained = cleared = true
         for chunk in 2:n
             k = worker_for_chunk(chunk, skip)
             err = @inbounds pool.errs[k]
@@ -912,9 +913,9 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
         has_scope && (@atomic :monotonic pool.scope = nothing)
         for chunk in 2:n
             k = worker_for_chunk(chunk, skip)
-            # The workers only read their slots (`run_job_own`), stolen and cancelled
-            # chunks included
-            copies && clear_slot!(@inbounds wslots[k])
+            # The workers only read their slots (`run_job_own`): emptied while waiting
+            # for the workers, else here (stolen and cancelled chunks included)
+            cleared || (copies && clear_slot!(@inbounds wslots[k]))
             # A worker whose chunk threw, or that died with its command set
             # (`dead_worker_error`)
             if (@inbounds pool.errs[k]) !== nothing ||
@@ -1005,10 +1006,20 @@ end
 # Wait until the workers of chunks `from:n` are idle. A dead worker is reported only once
 # the others have finished, since the region's slot and buffers are released afterwards.
 @inline function wait_workers(pool::Pool, from, n, skip)
+    return wait_workers(pool, from, n, skip, worker_slot_vector(Nothing), false)
+end
+# The same, emptying the slot of each worker (`copies`) as soon as the worker is idle: the
+# stores overlap the wait for the others, so that only the last worker's is on the
+# dispatcher's way out of the region (`worker_slot_vector`)
+@inline function wait_workers(pool::Pool, from, n, skip, wslots, copies::Bool)
     dead = 0
     for chunk in from:n
         k = worker_for_chunk(chunk, skip)
-        wait_idle(pool, k) || (dead = k)
+        if wait_idle(pool, k)
+            copies && clear_slot!(@inbounds wslots[k])
+        else
+            dead = k
+        end
     end
     dead == 0 || dead_worker_error(dead)
     return nothing
