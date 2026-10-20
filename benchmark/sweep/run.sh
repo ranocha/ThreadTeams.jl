@@ -117,22 +117,22 @@ expand_cpus() {
     tr ',' '\n' <<<"$1" | awk -F- 'NF == 2 { for (i = $1; i <= $2; i++) print i; next } NF { print }'
 }
 
-# One CPU per physical core, in CPU order, among the CPUs this process may use
+# One CPU per physical core among the CPUs this process may use: the first CPU of each
+# `thread_siblings_list` (the CPUs that share a core; `lscpu`'s core ids repeat per
+# cluster on some ARM chips). The cores of the highest `cpu_capacity` come first (the big
+# cores of a big.LITTLE chip, so that a small thread count does not run on the small
+# ones), each class in CPU order; capacities within 64 of a multiple of 128 count as one
+# class (a chip's big cores differ by a few percent). Without `cpu_capacity` (x86), CPU
+# order, which keeps the first cores on one chiplet.
 physical_cpus() {
-    local allowed
-    allowed=$(awk '/^Cpus_allowed_list/ { print $2 }' /proc/self/status)
-    if command -v lscpu >/dev/null 2>&1; then
-        lscpu -p=CPU,CORE,SOCKET | grep -v '^#'
-    else
-        for d in /sys/devices/system/cpu/cpu[0-9]*; do
-            [[ -r $d/topology/core_id ]] || continue
-            echo "${d##*cpu},$(cat "$d/topology/core_id"),$(cat "$d/topology/physical_package_id")"
-        done | sort -t, -k1,1n
-    fi | awk -F, -v allowed="$(expand_cpus "$allowed" | paste -sd, -)" '
-        BEGIN { n = split(allowed, a, ","); for (i = 1; i <= n; i++) ok[a[i]] = 1 }
-        # Some kernels report no core ids: then every CPU counts as a core
-        { core = ($2 == "" ? "cpu" $1 : $3 "," $2) }
-        ($1 in ok) && !(core in seen) { seen[core] = 1; print $1 }' | paste -sd, -
+    local allowed d n
+    allowed=" $(expand_cpus "$(awk '/^Cpus_allowed_list/ { print $2 }' /proc/self/status)" | paste -sd' ' -) "
+    for d in /sys/devices/system/cpu/cpu[0-9]*; do
+        n=${d##*cpu}
+        [[ $allowed == *" $n "* ]] || continue
+        echo "$n $(cat "$d/topology/thread_siblings_list" 2>/dev/null || echo "$n") $(cat "$d/cpu_capacity" 2>/dev/null || echo 1024)"
+    done | sort -k1,1n | awk '!seen[$2]++ { print int($3 / 128 + 0.5), $1 }' |
+        sort -s -k1,1nr | awk '{ print $2 }' | paste -sd, -
 }
 
 if [[ -z ${CPUS:-} && $OS == Linux ]]; then
@@ -337,7 +337,8 @@ for ((round = 1; round <= REPEAT; round++)); do
         for b in $BENCHES; do
             case $b in
                 epcc)
-                    for bin in "${EPCC_BINS[@]}"; do run_epcc "$bin" "$n"; done
+                    # (`${a[@]+...}`: bash 3.2, macOS's, rejects an empty array under `set -u`)
+                    for bin in ${EPCC_BINS[@]+"${EPCC_BINS[@]}"}; do run_epcc "$bin" "$n"; done
                     ;;
                 overhead | syncbench | counters | wakeup | steal)
                     [[ $b == counters ]] && ((!PERF_OK)) && continue
