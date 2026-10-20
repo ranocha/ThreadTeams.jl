@@ -23,7 +23,8 @@
 #   QUICK=1         shorter runs, for a first look
 #   OUT             results directory (default `benchmark/sweep/results/<host>-<date>`)
 #   LOCK            lock file shared by the benchmarks on this host (default
-#                   /tmp/threadteams-bench.lock; empty for none)
+#                   /tmp/threadteams-bench.lock, or the directory $LOCK.d without flock;
+#                   empty for none)
 #   EPCC_CC         C compilers for EPCC (default "gcc clang": libgomp and libomp)
 #   COUNTERS_EVENTS LinuxPerf event groups for `counters` (see benchmark/overhead/counters.jl)
 #   CODE_ALIGN      0 to compile with LLVM's default code alignment (default 1, see below)
@@ -214,15 +215,27 @@ if [[ -n $LOCK ]] && command -v flock >/dev/null 2>&1; then
         log "waiting for $LOCK (another benchmark runs on this host)"
         flock 9
     fi
+elif [[ -n $LOCK ]]; then
+    # No flock (macOS): a directory as the lock, created atomically by `mkdir`
+    if ! mkdir "$LOCK.d" 2>/dev/null; then
+        log "waiting for $LOCK.d (another benchmark runs on this host)"
+        until mkdir "$LOCK.d" 2>/dev/null; do sleep 2; done
+    fi
+    trap 'rmdir "$LOCK.d" 2>/dev/null' EXIT
 fi
 
 # --- Setup: Julia environments and EPCC ---------------------------------------------------
 
 for j in "${JULIAS[@]}"; do
     log "instantiating benchmark/sweep for $j"
-    # One manifest per Julia version: Pkg uses `Manifest-vX.Y.toml` only if it exists
+    # One manifest per Julia version: Pkg uses `Manifest-vX.Y.toml` only if it exists. A
+    # new one in every sweep: `resolve` keeps the packages of an existing manifest even
+    # where `[sources]` in Project.toml now names another (e.g. a branch with a fix), so a
+    # sweep would silently measure the code of the one before
     $j --startup-file=no -e '
-        touch(joinpath(ARGS[1], "Manifest-v$(VERSION.major).$(VERSION.minor).toml"))
+        manifest = joinpath(ARGS[1], "Manifest-v$(VERSION.major).$(VERSION.minor).toml")
+        rm(manifest; force = true)
+        touch(manifest)
         using Pkg
         # `resolve` neither installs the General registry in a new depot, as `add` does,
         # nor updates a stale one (which may not know the versions of the compat bounds)
