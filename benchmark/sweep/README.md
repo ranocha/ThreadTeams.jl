@@ -37,6 +37,12 @@ listed at the top of `run.sh`; the most useful:
   mechanism), under a lock file shared by all users of the script on the host (`LOCK`).
   The one-minute load average before each run is recorded with the results: on a shared
   machine, look at it before the numbers.
+- **Code alignment.** Julia compiles with `-align-all-nofallthru-blocks=6`
+  (`CODE_ALIGN=0` turns it off), so that where the hot loops fall relative to the
+  64-byte fetch blocks does not differ between builds and processes. Package images
+  leave LLVM options out of their cache key, so the aligned runs use a depot of their own
+  (`.cache/<host>/depot-aligned`), compiled once per host and Julia version (a few
+  minutes); juliaup still finds its Julia installations in the usual depot.
 - **Environment.** `benchmark/sweep/Project.toml` is the environment of
   `benchmark/overhead` plus Polyester; each Julia version gets its own
   `Manifest-vX.Y.toml`.

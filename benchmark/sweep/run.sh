@@ -26,6 +26,8 @@
 #                   /tmp/threadteams-bench.lock; empty for none)
 #   EPCC_CC         C compilers for EPCC (default "gcc clang": libgomp and libomp)
 #   COUNTERS_EVENTS LinuxPerf event groups for `counters` (see benchmark/overhead/counters.jl)
+#   CODE_ALIGN      0 to compile with LLVM's default code alignment (default 1, see below)
+#   CODE_ALIGN_ARGS the LLVM options for it (default -align-all-nofallthru-blocks=6)
 set -euo pipefail
 
 SWEEP=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -86,6 +88,26 @@ if [[ -n $JULIA_CHANNELS ]]; then
     done
 else
     JULIAS=("$JULIA")
+fi
+
+# --- Code alignment -----------------------------------------------------------------------
+
+# Where the compiler places the hot loops (the workers' spin loop, the dispatcher's wait)
+# relative to the 64-byte fetch blocks changes the time per loop by a few percent between
+# builds and processes. Aligning every block that is not reached by fall-through to 64
+# bytes takes that out of the comparison. The option reaches only code compiled with it:
+# the cache key of package images leaves out LLVM options, so an image compiled without
+# it would be loaded as valid. The aligned runs therefore use a depot of their own, in
+# which every package is compiled with it (once per host and Julia version), with juliaup
+# still finding its Julia installations in the usual depot. The system image (Base) keeps
+# its own alignment.
+CODE_ALIGN=${CODE_ALIGN:-1}
+CODE_ALIGN_ARGS=${CODE_ALIGN_ARGS:--align-all-nofallthru-blocks=6}
+if ((CODE_ALIGN)); then
+    first_depot=${JULIA_DEPOT_PATH:-$HOME/.julia}
+    export JULIAUP_DEPOT_PATH=${JULIAUP_DEPOT_PATH:-${first_depot%%:*}}
+    export JULIA_DEPOT_PATH=$CACHE/depot-aligned
+    export JULIA_LLVM_ARGS="${JULIA_LLVM_ARGS:+$JULIA_LLVM_ARGS }$CODE_ALIGN_ARGS"
 fi
 
 # --- Topology -----------------------------------------------------------------------------
@@ -161,6 +183,7 @@ csv_row() { # julia threads bench mechanism metric value
     echo "ThreadTeams: $(git -C "$ROOT" rev-parse HEAD 2>/dev/null || cat "$ROOT/.sweep-commit" 2>/dev/null || echo unknown)"
     echo "CPUs used, in order: ${CPUS:-unknown (no pinning)}"
     echo "thread counts: $THREADS"
+    echo "code alignment: $( ((CODE_ALIGN)) && echo "$CODE_ALIGN_ARGS (depot $JULIA_DEPOT_PATH)" || echo "LLVM default")"
     echo "load: $(cat /proc/loadavg 2>/dev/null || uptime)"
     if [[ -r /proc/sys/kernel/perf_event_paranoid ]]; then
         echo "perf_event_paranoid: $(cat /proc/sys/kernel/perf_event_paranoid)"
