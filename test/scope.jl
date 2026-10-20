@@ -52,8 +52,8 @@
     wslot[] = f
     job(1, 5)   # the older closure still runs in its world
     @test r[5] == 1
-    # the worker only reads its slot: the dispatcher empties it after the region
-    @test isassigned(wslot)
+    # the worker empties its slot after the chunk, unless the dispatcher does
+    @test isassigned(wslot) == ThreadTeams.DISPATCHER_CLEARS[]
     ThreadTeams.clear_slot!(wslot)
     ThreadTeams.clear_slot!(slot)
 end

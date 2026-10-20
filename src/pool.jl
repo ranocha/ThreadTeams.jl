@@ -177,6 +177,49 @@ ChunkCounter() = ChunkCounter(pad_before(), 0, pad_after())
 # measured at no gain: the loads delay the claim by about as much as they save.)
 const COPY_BYTES = 256
 
+# Who empties a worker's slot after the region (`worker_slot_vector`). If the worker does,
+# the line is modified in its cache, and the dispatcher's next store into the slot has to
+# fetch it back (a read-for-ownership that hits a modified line, waited for at the fence
+# of `dispatch!`). If the dispatcher does (while waiting for the workers, `wait_workers`),
+# the worker's copy stays clean and the next store only invalidates it, but the
+# dispatcher spends a store per worker. Which is faster depends on the CPU: on Intel the
+# dispatcher's (#46: Broadwell-EP 2-3 fewer RFO HITM per loop with 4-6 threads, Cascade
+# Lake about 15% faster with 4 threads); on Zen 3, the NVIDIA GB10 (Cortex-X925) and the
+# Apple M1 the worker's (5-20% faster with 4-16 threads; on Zen 3 a read of a modified
+# line moves it to the reader, so the dispatcher's store misses either way). Set once per
+# process from `dispatcher_clears_slots()` when the pool starts, before its workers.
+const DISPATCHER_CLEARS = Ref(false)
+
+"""
+    ThreadTeams.dispatcher_clears_slots(cpu = Sys.CPU_NAME, arch = Sys.ARCH,
+        setting = get(ENV, "THREADTEAMS_SLOT_CLEARING", "")) -> Bool
+
+Whether the dispatcher, rather than each worker, empties the workers' chunk-function slots
+after a region: `true` on Intel x86 CPUs, `false` on AMD, ARM and unknown CPUs. The
+environment variable `THREADTEAMS_SLOT_CLEARING` (`dispatcher` or `worker`) overrides it.
+Read once per process, when the pool starts.
+"""
+function dispatcher_clears_slots(
+        cpu::AbstractString = Sys.CPU_NAME, arch::Symbol = Sys.ARCH,
+        setting::AbstractString = get(ENV, "THREADTEAMS_SLOT_CLEARING", "")
+    )
+    setting == "dispatcher" && return true
+    setting == "worker" && return false
+    isempty(setting) || @warn "THREADTEAMS_SLOT_CLEARING should be `dispatcher` or `worker`, not `$setting`; using the default"
+    (arch === :x86_64 || arch === :i686) || return false
+    # LLVM's names of AMD's x86 CPUs, and generic targets (unknown vendor)
+    amd = ("znver", "bdver", "btver", "amdfam", "barcelona", "k8", "opteron", "athlon")
+    return !(any(p -> startswith(cpu, p), amd) || cpu == "generic" || startswith(cpu, "x86-64"))
+end
+
+# Computed once per process (`Base.OncePerProcess`, Julia >= 1.12); before, when a pool
+# starts, which happens once per process too unless the pool is shut down
+@static if isdefined(Base, :OncePerProcess)
+    const SLOT_CLEARING = Base.OncePerProcess{Bool}(dispatcher_clears_slots)
+else
+    const SLOT_CLEARING = dispatcher_clears_slots
+end
+
 # A slot for a chunk function of type `F` (`job_slot`, `worker_slots`): one element of a
 # `Memory{F}` (a `Vector{F}` on Julia 1.10) with a cache line of unused elements on each
 # side, since it is written in every region. Stored with a typed `setindex!` (so with the
@@ -437,10 +480,12 @@ function run_job_in_scope(pool::Pool, ws::WorkerState, k::Int, cmd::Int)
     return nothing
 end
 
-# Run chunk `chunk` from the worker's own slot. The worker only reads the slot; the
-# dispatcher empties it when the region ends (`dispatch!`), see `worker_slot_vector`.
+# Run chunk `chunk` from the worker's own slot, and empty the slot afterwards unless the
+# dispatcher does (`DISPATCHER_CLEARS`; when the chunk throws, the dispatcher does in any
+# case, see `dispatch!`)
 @inline function run_job_own(slot::Slot{F}, chunk::Int) where {F}
     run_chunk(slot, chunk)
+    DISPATCHER_CLEARS[] || clear_slot!(slot)
     return nothing
 end
 
@@ -618,6 +663,8 @@ end
 end
 
 @noinline function new_pool()
+    # Before the workers start, which read it
+    DISPATCHER_CLEARS[] = SLOT_CLEARING()
     pool = Pool()
     @atomic :release POOL.pool = pool
     return pool
@@ -651,15 +698,11 @@ end
     return slot
 end
 
-# The workers' slots for chunk functions of type `F` (`COPY_BYTES`): slot `k` is read by
-# worker `k` only. Only the dispatcher writes it: it stores the chunk function, and empties
-# the slot when the region ends (`dispatch!`). Were the worker to empty it after its chunk,
-# the line would be modified in the worker's cache, and the next region's store would have
-# to fetch it back from there first (a read-for-ownership that hits a modified line, one
-# per worker and region, waited for at the fence of `dispatch!`); read only, the worker's
-# copy is clean and the store only invalidates it, and the dispatcher's cleanup writes
-# lines that it holds already. The vector is created once per type like `job_slot`'s
-# cache, and grown when a region first needs the slots (so an image holds it empty).
+# The workers' slots for chunk functions of type `F` (`COPY_BYTES`): slot `k` is used by
+# worker `k` only. The dispatcher stores the chunk function; the worker or the dispatcher
+# empties the slot after the chunk, depending on the CPU (`DISPATCHER_CLEARS`). The vector
+# is created once per type like `job_slot`'s cache, and grown when a region first needs the
+# slots (so an image holds it empty).
 @generated function worker_slot_vector(::Type{F}) where {F}
     return :($(Slot{F}[]))
 end
@@ -847,6 +890,7 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
     # The workers' slots are used, and need to exist, only for a small `f` (`COPY_BYTES`)
     copies = own_slots(F)
     wslots = copies ? worker_slots(F, length(pool.workers)) : worker_slot_vector(F)
+    clears = copies && DISPATCHER_CLEARS[]
     base = cmd_base(n, skip, has_scope)
     # Whether every worker of the region is idle (also when a chunk threw), and whether the
     # workers' slots are empty
@@ -858,7 +902,7 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
             # Normally idle (an interrupted region waits for its workers); detects a dead one
             if !wait_idle(pool, k)
                 # Take back the chunks already handed out before giving up
-                cancel_chunks(pool, chunk + 1, n, skip, base)
+                cancel_chunks(pool, chunk + 1, n, skip, base, wslots, copies)
                 wait_workers(pool, chunk + 1, n, skip)
                 drained = true
                 dead_worker_error(k)
@@ -883,7 +927,7 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
         catch
             # Cancel the chunks that were not started and wait for the others: never leave
             # workers running when returning from the region
-            cancel_chunks(pool, 2, n, skip, base)
+            cancel_chunks(pool, 2, n, skip, base, wslots, copies)
             wait_workers(pool, 2, n, skip)
             drained = true
             rethrow()
@@ -891,11 +935,11 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
         # The chunks that their worker has not claimed yet: a greedy region only takes them
         # back, a static one runs them
         if f isa GreedyJob
-            take_back_chunks(pool, n, skip, base)
+            take_back_chunks(pool, n, skip, base, wslots, copies)
         else
-            steal_chunks(pool, slot, n, skip, base)
+            steal_chunks(pool, slot, n, skip, base, wslots, copies)
         end
-        wait_workers(pool, 2, n, skip, wslots, copies)
+        wait_workers(pool, 2, n, skip, wslots, clears)
         drained = cleared = true
         for chunk in 2:n
             k = worker_for_chunk(chunk, skip)
@@ -906,20 +950,21 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
         # Thrown outside the chunks, e.g. an interrupt while waiting for the workers:
         # running chunks use the region's slots, buffers and greedy counter, which the next
         # region reuses, so wait for them before returning
-        drained || drain_workers(pool, f, n, skip, base)
+        drained || drain_workers(pool, f, n, skip, base, wslots, copies)
         # Keep neither the chunk function (`clear_slot!`), nor the scope, nor the chunks'
         # exceptions alive (every used worker is idle here, also when a chunk threw)
         clear_slot!(slot)
         has_scope && (@atomic :monotonic pool.scope = nothing)
         for chunk in 2:n
             k = worker_for_chunk(chunk, skip)
-            # The workers only read their slots (`run_job_own`): emptied while waiting
-            # for the workers, else here (stolen and cancelled chunks included)
-            cleared || (copies && clear_slot!(@inbounds wslots[k]))
+            # If the dispatcher empties the slots: emptied while waiting for the workers,
+            # else here
+            clears && !cleared && clear_slot!(@inbounds wslots[k])
             # A worker whose chunk threw, or that died with its command set
-            # (`dead_worker_error`)
+            # (`dead_worker_error`), left the chunk function in its slot
             if (@inbounds pool.errs[k]) !== nothing ||
                     (@atomic :monotonic (@inbounds pool.workers[k]).cmd) != 0
+                copies && !clears && clear_slot!(@inbounds wslots[k])
                 @inbounds pool.errs[k] = nothing
             end
         end
@@ -937,20 +982,23 @@ end
 # A load first: a compare-and-swap on a line the worker just wrote takes it from the
 # worker's cache (and its final `cmd = 0` takes it back); a load only shares it. Relaxed:
 # nothing of the worker's is read after a steal; `wait_workers` acquires the results of
-# the workers that did claim. The slot of a stolen chunk is emptied with the others when
-# the region ends.
+# the workers that did claim. The worker of a stolen chunk never runs it, so the
+# dispatcher clears its slot (still in the dispatcher's cache) right away.
 #
 # Decreasing chunk order: the children of a chunk in the wake-up tree (`2chunk`,
 # `2chunk + 1`) are stolen or claimed before it, so stealing it wakes no one. In increasing
 # order the dispatcher woke the children of each chunk it stole, and then stole their
 # chunks too: a short loop after the workers fell asleep woke every worker for nothing.
-@inline function steal_chunks(pool::Pool, slot, n::Int, skip::Int, base::Int)
+@inline function steal_chunks(
+        pool::Pool, slot, n::Int, skip::Int, base::Int, wslots, copies::Bool
+    )
     for chunk in n:-1:2
         k = worker_for_chunk(chunk, skip)
         ws = @inbounds pool.workers[k]
         cmd = base | chunk
         if (@atomic :monotonic ws.cmd) == cmd &&
                 (@atomicreplace :monotonic ws.cmd cmd => 0).success
+            copies && clear_slot!(@inbounds wslots[k])
             @atomic :monotonic pool.stolen = (@atomic :monotonic pool.stolen) + 1
             try
                 run_chunk(slot, chunk)
@@ -968,8 +1016,10 @@ end
 # would be wasted. The children are taken back too unless their worker claims first; a
 # worker not woken stays asleep, so a burst of regions shorter than a wake-up recruits one
 # level of the wake-up tree per region.
-@inline function take_back_chunks(pool::Pool, n::Int, skip::Int, base::Int)
-    taken = cancel_chunks(pool, 2, n, skip, base)
+@inline function take_back_chunks(
+        pool::Pool, n::Int, skip::Int, base::Int, wslots, copies::Bool
+    )
+    taken = cancel_chunks(pool, 2, n, skip, base, wslots, copies)
     @atomic :monotonic pool.stolen = (@atomic :monotonic pool.stolen) + taken
     return nothing
 end
@@ -988,8 +1038,8 @@ function stolen_chunks()
 end
 
 # Take the chunks `from:n` away from the workers that have not claimed them yet; returns
-# how many. A load first, relaxed: see `steal_chunks`.
-@inline function cancel_chunks(pool::Pool, from, n, skip, base)
+# how many. A load first, relaxed, and the slots cleared: see `steal_chunks`.
+@inline function cancel_chunks(pool::Pool, from, n, skip, base, wslots, copies::Bool)
     taken = 0
     for chunk in from:n
         k = worker_for_chunk(chunk, skip)
@@ -997,6 +1047,7 @@ end
         cmd = base | chunk
         if (@atomic :monotonic ws.cmd) == cmd &&
                 (@atomicreplace :monotonic ws.cmd cmd => 0).success
+            copies && clear_slot!(@inbounds wslots[k])
             taken += 1
         end
     end
@@ -1027,9 +1078,9 @@ end
 
 # Cancel the chunks of a region no worker has claimed and wait for the others, also when
 # interrupted again meanwhile (the region's exception is already on its way)
-@noinline function drain_workers(pool::Pool, f, n, skip, base)
+@noinline function drain_workers(pool::Pool, f, n, skip, base, wslots, copies::Bool)
     f isa GreedyJob && (@atomic :monotonic f.counter.next = typemax(Int) >> 1)
-    cancel_chunks(pool, 2, n, skip, base)
+    cancel_chunks(pool, 2, n, skip, base, wslots, copies)
     for chunk in 2:n
         k = worker_for_chunk(chunk, skip)
         while true

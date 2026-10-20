@@ -89,19 +89,56 @@ end
     end
 end
 
-@testset "own slots" begin
-    @test !ThreadTeams.own_slots(BigJob)
-    @test ThreadTeams.own_slots(MutableJob) && ThreadTeams.own_slots(UnionJob)
-    for _ in 1:100
-        @test all(==(3.5), slot_loops(NW))   # 1 + 1 + 2.5 - 1
+# Who empties the workers' slots: chosen once per process from the CPU, the environment
+# variable overrides it
+@testset "slot clearing" begin
+    clears = ThreadTeams.dispatcher_clears_slots
+    @test clears("cascadelake", :x86_64, "")
+    @test clears("broadwell", :x86_64, "")
+    @test clears("alderlake", :x86_64, "")
+    @test !clears("znver3", :x86_64, "")
+    @test !clears("znver5", :x86_64, "")
+    @test !clears("bdver2", :x86_64, "")
+    @test !clears("generic", :x86_64, "")
+    @test !clears("x86-64-v3", :x86_64, "")
+    @test !clears("neoverse-v2", :aarch64, "")
+    @test !clears("apple-m1", :aarch64, "")
+    @test clears("apple-m1", :aarch64, "dispatcher")
+    @test !clears("cascadelake", :x86_64, "worker")
+    @test (@test_logs (:warn,) clears("cascadelake", :x86_64, "both")) == true
+    # the pool reads it when it starts
+    tforeach(identity, 1:NW; scheduler = team)
+    @test ThreadTeams.DISPATCHER_CLEARS[] == ThreadTeams.SLOT_CLEARING()
+end
+
+# The slot tests below in both modes: `DISPATCHER_CLEARS` is read once per region, so it
+# can change between regions
+const SLOT_MODES = (false, true)
+function with_slot_mode(f, mode)
+    old = ThreadTeams.DISPATCHER_CLEARS[]
+    ThreadTeams.DISPATCHER_CLEARS[] = mode
+    return try
+        f()
+    finally
+        ThreadTeams.DISPATCHER_CLEARS[] = old
     end
-    if NW > 1
-        # a small chunk function has a slot per worker, a large one none
-        for (F, nslots) in ((BigJob, 0), (MutableJob, NW), (UnionJob, NW))
-            @test !isassigned(ThreadTeams.job_slot(F))
-            slots = ThreadTeams.worker_slot_vector(F)
-            @test length(slots) == nslots
-            @test !any(isassigned, slots)
+end
+
+@testset "own slots, dispatcher clears: $mode" for mode in SLOT_MODES
+    with_slot_mode(mode) do
+        @test !ThreadTeams.own_slots(BigJob)
+        @test ThreadTeams.own_slots(MutableJob) && ThreadTeams.own_slots(UnionJob)
+        for _ in 1:100
+            @test all(==(3.5), slot_loops(NW))   # 1 + 1 + 2.5 - 1
+        end
+        if NW > 1
+            # a small chunk function has a slot per worker, a large one none
+            for (F, nslots) in ((BigJob, 0), (MutableJob, NW), (UnionJob, NW))
+                @test !isassigned(ThreadTeams.job_slot(F))
+                slots = ThreadTeams.worker_slot_vector(F)
+                @test length(slots) == nslots
+                @test !any(isassigned, slots)
+            end
         end
     end
 end
@@ -113,16 +150,18 @@ struct ThrowingJob
 end
 (j::ThrowingJob)(i) = i == length(j.x) ? throw(ArgumentError("chunk $i")) : (j.x[i] = 1.0; nothing)
 
-@testset "own slots: exceptions" begin
-    if NW > 1
-        x = zeros(NW)
-        @test_throws ArgumentError ThreadTeams.run_chunks(ThrowingJob(x), NW, team)
-        @test !isassigned(ThreadTeams.job_slot(ThrowingJob))
-        @test !any(isassigned, ThreadTeams.worker_slot_vector(ThrowingJob))
-        # The next loop with the same chunk function type works
-        y = zeros(NW + 1)
-        ThreadTeams.run_chunks(ThrowingJob(y), NW, team)
-        @test all(==(1.0), y[1:NW])
-        @test !any(isassigned, ThreadTeams.worker_slot_vector(ThrowingJob))
+@testset "own slots: exceptions, dispatcher clears: $mode" for mode in SLOT_MODES
+    with_slot_mode(mode) do
+        if NW > 1
+            x = zeros(NW)
+            @test_throws ArgumentError ThreadTeams.run_chunks(ThrowingJob(x), NW, team)
+            @test !isassigned(ThreadTeams.job_slot(ThrowingJob))
+            @test !any(isassigned, ThreadTeams.worker_slot_vector(ThrowingJob))
+            # The next loop with the same chunk function type works
+            y = zeros(NW + 1)
+            ThreadTeams.run_chunks(ThrowingJob(y), NW, team)
+            @test all(==(1.0), y[1:NW])
+            @test !any(isassigned, ThreadTeams.worker_slot_vector(ThrowingJob))
+        end
     end
 end
