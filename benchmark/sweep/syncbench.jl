@@ -95,8 +95,11 @@ function run_reps_red(f, reps, n)
     return
 end
 
-# `innerreps` as EPCC computes it: doubled until one test takes the target time
+# `innerreps` as EPCC computes it: doubled until one test takes the target time. Compiled
+# and warmed up first (EPCC's C has nothing to compile): otherwise the first test already
+# takes the target time, and the measured loops are too few to amortise waking the workers
 function innerreps_for(run, f, n)
+    run(f, 10, n)
     reps = 10
     t = 0.0
     while t < TARGET_US
@@ -118,8 +121,9 @@ function measure(run, f, n)
     end
     return mean(times), std(times), median(times), reps
 end
-# With the mechanism as a type parameter, so that the loop is not a dynamic dispatch
-measure(run, f, ::Val{m}, n) where {m} = measure(run, k -> f(Val{m}(), k), n)
+# With the mechanism as a type parameter, and `f` specialised on (Julia does not specialise
+# on a function argument that is only passed on), so that the loop is not a dynamic dispatch
+measure(run, f::F, ::Val{m}, n) where {F, m} = measure(run, k -> f(Val{m}(), k), n)
 
 function main()
     n = delaylength_for(DELAY_US)
@@ -141,8 +145,8 @@ function main()
             t = measure(run, f, Val(m), n)
             ovh, ci, med = t[1] - r[1], CONF95 * (t[2] + r[2]), t[3] - r[3]
             @printf(
-                "%-12s %-16s time %8.3f µs  overhead %8.3f ± %6.3f µs  median overhead %8.3f µs\n",
-                test, m, t[1], ovh, ci, med
+                "%-12s %-16s reps %7d  time %8.3f µs  overhead %8.3f ± %6.3f µs  median overhead %8.3f µs\n",
+                test, m, t[4], t[1], ovh, ci, med
             )
             record("syncbench", "$test $m", "overhead_mean_us", ovh)
             record("syncbench", "$test $m", "overhead_ci95_us", ci)
