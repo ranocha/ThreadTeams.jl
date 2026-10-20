@@ -44,13 +44,15 @@ const EVENTS = get(
         "(cache-references, cache-misses), (L1-dcache-loads, L1-dcache-load-misses), " *
         "(task-clock, context-switches, cpu-migrations)"
 )
+# One measurement per group: with all groups open at once, some kernels and CPUs return 0
+# for events that they report as counted the whole time (cycles and cache misses on a
+# Broadwell Xeon with the NMI watchdog on), instead of multiplexing them
+const GROUPS = [m.match for m in eachmatch(r"\([^()]*\)|[^\s,()][^,()]*", EVENTS)]
 # Number of loops measured, relative to the defaults below
 const SCALE = parse(Float64, get(ENV, "COUNTERS_SCALE", "1"))
 
 # Per-event totals over the measured threads, scaled for multiplexing
-function totals(stats)
-    order = String[]
-    acc = Dict{String, Float64}()
+function totals!(order, acc, stats)
     for t in stats.threads, g in t.groups, c in g
         c.enabled > 0 || continue
         name = string(c.event)
@@ -63,8 +65,12 @@ end
 function report(name, f, x, n; threads)
     loops(f, x, 1000)
     n = max(round(Int, SCALE * n), 1)
-    stats = @pstats EVENTS threads = threads loops(f, x, n)
-    order, acc = totals(stats)
+    order = String[]
+    acc = Dict{String, Float64}()
+    for group in GROUPS
+        stats = @pstats group threads = threads loops(f, x, n)
+        totals!(order, acc, stats)
+    end
     @printf("%-14s %s ", name, threads ? "all threads:   " : "calling thread:")
     for ev in order
         short = replace(
