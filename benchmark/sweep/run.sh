@@ -23,7 +23,7 @@
 #   QUICK=1         shorter runs, for a first look
 #   OUT             results directory (default `benchmark/sweep/results/<host>-<date>`)
 #   LOCK            lock file shared by the benchmarks on this host (default
-#                   /tmp/threadteams-bench.lock, or the directory $LOCK.d without flock;
+#                   /tmp/threadteams-bench.lock, or the directory ${LOCK}dir without flock;
 #                   empty for none)
 #   EPCC_CC         C compilers for EPCC (default "gcc clang": libgomp and libomp)
 #   COUNTERS_EVENTS LinuxPerf event groups for `counters` (see benchmark/overhead/counters.jl)
@@ -217,11 +217,11 @@ if [[ -n $LOCK ]] && command -v flock >/dev/null 2>&1; then
     fi
 elif [[ -n $LOCK ]]; then
     # No flock (macOS): a directory as the lock, created atomically by `mkdir`
-    if ! mkdir "$LOCK.d" 2>/dev/null; then
-        log "waiting for $LOCK.d (another benchmark runs on this host)"
-        until mkdir "$LOCK.d" 2>/dev/null; do sleep 2; done
+    if ! mkdir "${LOCK}dir" 2>/dev/null; then
+        log "waiting for ${LOCK}dir (another benchmark runs on this host)"
+        until mkdir "${LOCK}dir" 2>/dev/null; do sleep 2; done
     fi
-    trap 'rmdir "$LOCK.d" 2>/dev/null' EXIT
+    trap 'rmdir "${LOCK}dir" 2>/dev/null' EXIT
 fi
 
 # --- Setup: Julia environments and EPCC ---------------------------------------------------
