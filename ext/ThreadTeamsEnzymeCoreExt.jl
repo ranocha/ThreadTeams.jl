@@ -25,9 +25,8 @@ using ThreadTeams: ThreadTeams, TeamSchedulers, run_chunks, run_fold
 using EnzymeCore: EnzymeCore, EnzymeRules, Annotation, Const, Active, Duplicated,
     MixedDuplicated, BatchDuplicated, BatchMixedDuplicated, Forward,
     ForwardWithPrimal, ReverseSplitWithPrimal, ReverseSplitModified,
-    ReverseSplitWidth, autodiff, autodiff_thunk, make_zero,
-    set_runtime_activity, set_strong_zero
-using EnzymeCore.EnzymeRules: FwdConfig, RevConfig, AugmentedReturn
+    ReverseSplitWidth, autodiff, autodiff_thunk, make_zero
+using EnzymeCore.EnzymeRules: FwdConfig, RevConfig, AugmentedReturn, set_config
 
 # One chunk of the loop
 @inline function call_chunk(r::Base.RefValue{F}, c::Int) where {F}
@@ -56,18 +55,14 @@ rebind(f::MixedDuplicated, r::Duplicated) = Duplicated(r.val, f.dval)
 rebind(f::BatchMixedDuplicated, r::BatchDuplicated) = BatchDuplicated(r.val, f.dval)
 rebind(f, r) = r
 
-function forward_mode(config::FwdConfig)
-    mode = set_runtime_activity(Forward, config)
-    return set_strong_zero(mode, config)
-end
+forward_mode(config::FwdConfig) = set_config(Forward, config)
 
 # Reverse split mode for `call_chunk(r, c)`. Whatever the loop function captures may be
 # overwritten between the forward and the reverse pass if the rule's argument may be.
 function reverse_mode(config::RevConfig, overwritten::Bool, width::Int = EnzymeRules.width(config))
     mode = ReverseSplitModified(ReverseSplitWithPrimal, Val((false, overwritten, false)))
     mode = ReverseSplitWidth(mode, Val(width))
-    mode = set_runtime_activity(mode, config)
-    return set_strong_zero(mode, config)
+    return set_config(mode, config)
 end
 
 #
@@ -211,7 +206,7 @@ function EnzymeRules.forward(
             dacc = make_zero(acc)
         else
             dacc, acc = autodiff(
-                set_runtime_activity(ForwardWithPrimal, config),
+                set_config(ForwardWithPrimal, config),
                 Const(fold_all), op, Duplicated(buf, dbuf)
             )
         end
@@ -232,7 +227,7 @@ function EnzymeRules.augmented_primal(
     if T === Nothing
         r = as_ref(f)
         rev, tapes = augmented_chunks(config, r, n.val, sched.val, overwritten)
-        return AugmentedReturn(nothing, nothing, (r, nothing, nothing, rev, tapes))
+        return AugmentedReturn(nothing, nothing, (r, nothing, nothing, rev, tapes, nothing))
     end
     check_fold(op, EnzymeRules.width(config))
     RT <: Union{Const, Active} ||
@@ -244,8 +239,18 @@ function EnzymeRules.augmented_primal(
             @inbounds dbuf[c] = make_zero(buf[c])
         end
     end
-    acc = EnzymeRules.needs_primal(config) ? fold_all(op.val, buf) : nothing
-    return AugmentedReturn(acc, nothing, (store, buf, dbuf, rev, tapes))
+    # The forward pass of the combine, with its tape: `op` may read memory that changes
+    # before the reverse pass, which then only runs the combine's reverse pass
+    bufs = dbuf === nothing ? Const(buf) : Duplicated(buf, dbuf)
+    mode = set_config(ReverseSplitWithPrimal, config)
+    fwd_c, rev_c = autodiff_thunk(
+        mode, Const{typeof(fold_all)}, RT, Core.Typeof(op), Core.Typeof(bufs)
+    )
+    tape_c, acc, _ = fwd_c(Const(fold_all), op, bufs)
+    return AugmentedReturn(
+        EnzymeRules.needs_primal(config) ? acc : nothing, nothing,
+        (store, buf, dbuf, rev, tapes, (rev_c, bufs, tape_c))
+    )
 end
 
 function EnzymeRules.reverse(
@@ -253,7 +258,7 @@ function EnzymeRules.reverse(
         dret, tape, f::Annotation, op::Annotation, n::Const{Int},
         sched::Const{<:TeamSchedulers}
     )
-    store, buf, dbuf, rev, tapes = tape
+    store, buf, dbuf, rev, tapes, combine = tape
     if buf === nothing
         # chunks without results
         r = rebind(f, store)
@@ -264,17 +269,12 @@ function EnzymeRules.reverse(
         # the partials store's shadow holds the chunk function's shadow reference
         store.dval[] = StorePartial(f.dval, dbuf)
     end
-    if dret isa Active && dbuf !== nothing
-        # adjoints of the partial results, seeded with the adjoint of the result
-        mode = set_runtime_activity(ReverseSplitWithPrimal, config)
-        fwd_c, rev_c = autodiff_thunk(
-            mode, Const{typeof(fold_all)},
-            Active{typeof(dret.val)}, Core.Typeof(op),
-            Duplicated{typeof(buf)}
-        )
-        bufs = Duplicated(buf, dbuf)
-        tape_c = fwd_c(Const(fold_all), op, bufs)[1]
+    # adjoints of the partial results, seeded with the adjoint of the result
+    rev_c, bufs, tape_c = combine
+    if dret isa Active
         rev_c(Const(fold_all), op, bufs, dret.val, tape_c)
+    else
+        rev_c(Const(fold_all), op, bufs, tape_c)
     end
     # adjoints of the chunks (also of what they wrote into shadow memory, with a constant
     # result)
