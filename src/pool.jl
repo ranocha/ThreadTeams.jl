@@ -212,12 +212,42 @@ function dispatcher_clears_slots(
     return !(any(p -> startswith(cpu, p), amd) || cpu == "generic" || startswith(cpu, "x86-64"))
 end
 
+# Whether the dispatcher hands a worker that the last region saw idle its next command
+# without first checking the worker's line (`seen_idle`, `dispatch!`). The check loads a
+# line the worker wrote last, a transfer per worker in a row: skipping it makes loops of
+# trivial chunks 10-31% faster on an NVIDIA GB10 (Cortex-X925, 4-10 threads) and 6-15%
+# on an Apple M1, but on x86 it was slower (Ryzen 9 5950X: +16% with 8 threads; Cascade
+# Lake: +2-5%), where the load apparently brings the line ahead of the command store.
+# Set once per process from `trusts_seen_idle()` when the pool starts.
+const TRUST_SEEN_IDLE = Ref(false)
+
+"""
+    ThreadTeams.trusts_seen_idle(arch = Sys.ARCH,
+        setting = get(ENV, "THREADTEAMS_IDLE_CHECK", "")) -> Bool
+
+Whether the dispatcher hands a worker that the last region saw idle its next command
+without checking the worker's state first: `true` on ARM (`aarch64`), `false` elsewhere.
+The environment variable `THREADTEAMS_IDLE_CHECK` (`unseen`: check only the workers not
+seen idle; `always`) overrides it. Read once per process, when the pool starts.
+"""
+function trusts_seen_idle(
+        arch::Symbol = Sys.ARCH,
+        setting::AbstractString = get(ENV, "THREADTEAMS_IDLE_CHECK", "")
+    )
+    setting == "unseen" && return true
+    setting == "always" && return false
+    isempty(setting) || @warn "THREADTEAMS_IDLE_CHECK should be `unseen` or `always`, not `$setting`; using the default"
+    return arch === :aarch64
+end
+
 # Computed once per process (`Base.OncePerProcess`, Julia >= 1.12); before, when a pool
 # starts, which happens once per process too unless the pool is shut down
 @static if isdefined(Base, :OncePerProcess)
     const SLOT_CLEARING = Base.OncePerProcess{Bool}(dispatcher_clears_slots)
+    const IDLE_CHECK = Base.OncePerProcess{Bool}(trusts_seen_idle)
 else
     const SLOT_CLEARING = dispatcher_clears_slots
+    const IDLE_CHECK = trusts_seen_idle
 end
 
 # A slot for a chunk function of type `F` (`job_slot`, `worker_slots`): one element of a
@@ -311,6 +341,11 @@ mutable struct Pool
     # `failed` tells whether any is set
     const errs::Vector{Any}
     const failed::ErrorFlag
+    # `seen_idle[k]`: the last region saw worker `k` idle when it waited for it, so the next
+    # one need not check before handing it a command (`dispatch!`). Written and read only
+    # by the dispatcher (which holds `busy`); cleared when a command goes out and after a
+    # region that failed or was cut short (`clean_up_region`)
+    const seen_idle::Vector{Bool}
     # `tid2worker[tid]`: index of the worker running on thread `tid`, or `0`
     const tid2worker::Vector{Int}
     const sleepflags::Vector{SleepFlag}
@@ -618,7 +653,7 @@ function Pool()
     pool = Pool(
         nothing, [WorkerState() for _ in 1:nw],
         [Base.Event(true) for _ in 1:nw], Task[], Any[nothing for _ in 1:nw], ErrorFlag(),
-        tid2worker, [SleepFlag() for _ in 1:nw], ChunkCounter(),
+        zeros(Bool, nw), tid2worker, [SleepFlag() for _ in 1:nw], ChunkCounter(),
         Any[nothing for _ in 1:nw], zeros(Int, nw), is_oversubscribed(), 0
     )
     # A new task inherits its creator's dynamic scope. The workers get none, so they
@@ -679,6 +714,7 @@ end
 @noinline function new_pool()
     # Before the workers start, which read it
     DISPATCHER_CLEARS[] = SLOT_CLEARING()
+    TRUST_SEEN_IDLE[] = IDLE_CHECK()
     pool = Pool()
     @atomic :release POOL.pool = pool
     return pool
@@ -904,6 +940,7 @@ end
     has_scope = scope !== nothing
     copies = own_slots(F)
     clears = copies && DISPATCHER_CLEARS[]
+    trust = TRUST_SEEN_IDLE[]
     base = cmd_base(n, skip, has_scope)
     # Whether every worker of the region is idle (also when a chunk threw), and whether the
     # workers' slots are empty: both until the first command goes out. `stored`: whether
@@ -928,8 +965,10 @@ end
         # Decreasing chunk order: see `wake_children`
         for chunk in n:-1:2
             k = worker_for_chunk(chunk, skip)
-            # Normally idle (an interrupted region waits for its workers); detects a dead one
-            if !wait_idle(pool, k)
+            # Normally idle (an interrupted region waits for its workers); detects a dead one.
+            # Where it pays (`TRUST_SEEN_IDLE`), not checked if the last region saw the
+            # worker idle: only the dispatcher sets a command, so the worker still is
+            if !(trust && @inbounds pool.seen_idle[k]) && !wait_idle(pool, k)
                 # Take back the chunks already handed out before giving up
                 cancel_chunks(pool, chunk + 1, n, skip, base, wslots, copies)
                 wait_workers(pool, chunk + 1, n, skip)
@@ -942,6 +981,7 @@ end
             # of `wake_children` (Dekker with the worker, which stores `sleeping` and loads
             # `cmd`). A wake-up still missed on a weakly ordered machine is repaired by the
             # re-notify of `wait_idle`; the region only takes longer.
+            @inbounds pool.seen_idle[k] = false
             ws = @inbounds pool.workers[k]
             copies && (@inbounds(wslots[k])[] = f)
             @atomic :monotonic ws.job = job
@@ -1009,6 +1049,7 @@ end
         end
     end
     @atomic :monotonic pool.failed.set = false
+    fill!(pool.seen_idle, false)
     return nothing
 end
 
@@ -1109,6 +1150,7 @@ end
         k = worker_for_chunk(chunk, skip)
         if wait_idle(pool, k)
             copies && clear_slot!(@inbounds wslots[k])
+            @inbounds pool.seen_idle[k] = true
         else
             dead = k
         end
