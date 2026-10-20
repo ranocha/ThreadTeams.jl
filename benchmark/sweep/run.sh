@@ -252,11 +252,13 @@ if has epcc && [[ ! -s $EPCC_TAR ]]; then
     [[ -s $EPCC_TAR ]] || log "fetching EPCC failed, running without it"
 fi
 src=$CACHE/epcc-$EPCC_COMMIT
-if has epcc && [[ -s $EPCC_TAR && ! -d $src ]]; then
+# Unpacked unless its sources are there (an interrupted run may have left the directory)
+if has epcc && [[ -s $EPCC_TAR && ! -f $src/openmpbench_C_v31/syncbench.c ]]; then
+    rm -rf "$src" "$src.part"
     mkdir -p "$src.part" && tar -xzf "$EPCC_TAR" -C "$src.part" --strip-components=1 && mv "$src.part" "$src" ||
         { rm -rf "$src.part"; log "unpacking EPCC failed, running without it"; }
 fi
-if has epcc && [[ -d $src ]]; then
+if has epcc && [[ -f $src/openmpbench_C_v31/syncbench.c ]]; then
     for cc in $EPCC_CC; do
         command -v "$cc" >/dev/null 2>&1 || { log "no $cc, skipping its OpenMP"; continue; }
         bin=$CACHE/syncbench-$cc
