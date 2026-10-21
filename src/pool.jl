@@ -326,17 +326,6 @@ mutable struct SleepFlag
 end
 SleepFlag() = SleepFlag(pad_before(), false, pad_after())
 
-# Set when a chunk of the region stored its exception into `errs` (by the worker before
-# its release store of `cmd = 0`, by the dispatcher for a chunk it stole), so that after a
-# region the dispatcher checks one line instead of every worker's `errs`; reset with
-# `errs` by the dispatcher. `errs` is therefore all `nothing` when a region starts.
-mutable struct ErrorFlag
-    const _pad0::PadBefore
-    @atomic set::Bool
-    const _pad1::PadAfter
-end
-ErrorFlag() = ErrorFlag(pad_before(), false, pad_after())
-
 mutable struct Pool
     # Region data that does not travel with the commands (`cmd_base`): the dispatcher's
     # dynamic scope, `nothing` when the caller has none. Written only when it changes, so
@@ -345,10 +334,16 @@ mutable struct Pool
     const workers::Vector{WorkerState}
     const events::Vector{Base.Event}
     const tasks::Vector{Task}
-    # `errs[k]`: `CapturedException` thrown by the chunk worker `k` ran, or `nothing`;
-    # `failed` tells whether any is set
+    # `errs[k]`: `CapturedException` thrown by the chunk worker `k` ran, or `nothing`
     const errs::Vector{Any}
-    const failed::ErrorFlag
+    # Set when a chunk of the region stored its exception into `errs` (by the worker
+    # before its release store of `cmd = 0`, by the dispatcher for a chunk it stole), so
+    # that after a region the dispatcher checks one line instead of every worker's `errs`;
+    # reset with `errs` by the dispatcher. `errs` is therefore all `nothing` when a region
+    # starts. On a cache line of its own (see `PadBefore`).
+    const _pad0::PadBefore
+    @atomic failed::Bool
+    const _pad1::PadAfter
     # `seen_idle[SEEN_PAD + k]`: the last region saw worker `k` idle when it waited for it,
     # so the next one need not check before handing it a command (`dispatch!`). Written
     # and read only by the dispatcher (which holds `busy`), and only where that pays
@@ -646,7 +641,7 @@ end
         if (@atomic :monotonic ws.cmd) == RUNNING
             # (The dispatcher clears this worker's slot, see `dispatch!`)
             pool.errs[k] = CapturedException(err, catch_backtrace())
-            @atomic :monotonic pool.failed.set = true
+            @atomic :monotonic pool.failed = true
             @atomic :release ws.cmd = 0
         end
     end
@@ -663,8 +658,9 @@ function Pool()
     nw <= CMD_MASK || error("ThreadTeams supports at most $CMD_MASK threads")
     pool = Pool(
         nothing, [WorkerState() for _ in 1:nw],
-        [Base.Event(true) for _ in 1:nw], Task[], Any[nothing for _ in 1:nw], ErrorFlag(),
-        zeros(Bool, nw + 2 * SEEN_PAD), tid2worker, [SleepFlag() for _ in 1:nw], ChunkCounter(),
+        [Base.Event(true) for _ in 1:nw], Task[], Any[nothing for _ in 1:nw],
+        pad_before(), false, pad_after(), zeros(Bool, nw + 2 * SEEN_PAD),
+        tid2worker, [SleepFlag() for _ in 1:nw], ChunkCounter(),
         Any[nothing for _ in 1:nw], zeros(Int, nw), is_oversubscribed(), 0
     )
     # A new task inherits its creator's dynamic scope. The workers get none, so they
@@ -1026,7 +1022,7 @@ end
         wait_workers(pool, 2, n, skip, wslots, clears, trust)
         drained = cleared = true
         # Relaxed: ordered by the acquire loads of the workers' `cmd = 0` (`wait_workers`)
-        (@atomic :monotonic pool.failed.set) && throw_first_error(pool, n, skip)
+        (@atomic :monotonic pool.failed) && throw_first_error(pool, n, skip)
     finally
         # Thrown outside the chunks, e.g. an interrupt while waiting for the workers:
         # running chunks use the region's slots, buffers and greedy counter, which the next
@@ -1038,7 +1034,7 @@ end
         has_scope && (@atomic :monotonic pool.scope = nothing)
         # After a region that ended normally there is nothing left to clean up: the
         # workers' slots are empty, no chunk failed
-        (cleared && !(@atomic :monotonic pool.failed.set)) ||
+        (cleared && !(@atomic :monotonic pool.failed)) ||
             clean_up_region(pool, n, skip, wslots, copies, clears, cleared)
         release && release_pool()
     end
@@ -1071,7 +1067,7 @@ end
             @inbounds pool.errs[k] = nothing
         end
     end
-    @atomic :monotonic pool.failed.set = false
+    @atomic :monotonic pool.failed = false
     fill!(pool.seen_idle, false)
     return nothing
 end
@@ -1108,7 +1104,7 @@ end
                 run_chunk(slot, chunk)
             catch err
                 @inbounds pool.errs[k] = CapturedException(err, catch_backtrace())
-                @atomic :monotonic pool.failed.set = true
+                @atomic :monotonic pool.failed = true
             end
         end
     end

@@ -105,7 +105,7 @@ end
             @test count(pool.seen_idle) == kept
             @test_throws ErrorException tforeach(i -> i == NW && error("chunk $i"), 1:NW; scheduler = team)
             @test !any(pool.seen_idle)
-            @test all(isnothing, pool.errs) && !pool.failed.set
+            @test all(isnothing, pool.errs) && !pool.failed
             tforeach(identity, 1:NW; scheduler = team)
             @test count(pool.seen_idle) == kept
         finally
