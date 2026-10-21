@@ -45,14 +45,16 @@
     job2 = Base.invokelatest(ThreadTeams.job_closure, slot)
     @test job2 !== job
     @test job2.world > job.world
-    wslot = ThreadTeams.worker_slots(typeof(f), 1)[1]   # emptied after every chunk
+    wslot = ThreadTeams.worker_slots(typeof(f), 1)[1]
     wslot[] = f
     job2(1, 5)
     @test r[5] == 3
     wslot[] = f
     job(1, 5)   # the older closure still runs in its world
     @test r[5] == 1
-    @test !isassigned(wslot)
+    # the worker empties its slot after the chunk, unless the dispatcher does
+    @test isassigned(wslot) == ThreadTeams.DISPATCHER_CLEARS[]
+    ThreadTeams.clear_slot!(wslot)
     ThreadTeams.clear_slot!(slot)
 end
 

@@ -177,6 +177,49 @@ ChunkCounter() = ChunkCounter(pad_before(), 0, pad_after())
 # measured at no gain: the loads delay the claim by about as much as they save.)
 const COPY_BYTES = 256
 
+# Who empties a worker's slot after the region (`worker_slot_vector`). If the worker does,
+# the line is modified in its cache, and the dispatcher's next store into the slot has to
+# fetch it back (a read-for-ownership that hits a modified line, waited for at the fence
+# of `dispatch!`). If the dispatcher does (while waiting for the workers, `wait_workers`),
+# the worker's copy stays clean and the next store only invalidates it, but the
+# dispatcher spends a store per worker. Which is faster depends on the CPU: on Intel the
+# dispatcher's (#46: Broadwell-EP 2-3 fewer RFO HITM per loop with 4-6 threads, Cascade
+# Lake about 15% faster with 4 threads); on Zen 3, the NVIDIA GB10 (Cortex-X925) and the
+# Apple M1 the worker's (5-20% faster with 4-16 threads; on Zen 3 a read of a modified
+# line moves it to the reader, so the dispatcher's store misses either way). Set once per
+# process from `dispatcher_clears_slots()` when the pool starts, before its workers.
+const DISPATCHER_CLEARS = Ref(false)
+
+"""
+    ThreadTeams.dispatcher_clears_slots(cpu = Sys.CPU_NAME, arch = Sys.ARCH,
+        setting = get(ENV, "THREADTEAMS_SLOT_CLEARING", "")) -> Bool
+
+Whether the dispatcher, rather than each worker, empties the workers' chunk-function slots
+after a region: `true` on Intel x86 CPUs, `false` on AMD, ARM and unknown CPUs. The
+environment variable `THREADTEAMS_SLOT_CLEARING` (`dispatcher` or `worker`) overrides it.
+Read once per process, when the pool starts.
+"""
+function dispatcher_clears_slots(
+        cpu::AbstractString = Sys.CPU_NAME, arch::Symbol = Sys.ARCH,
+        setting::AbstractString = get(ENV, "THREADTEAMS_SLOT_CLEARING", "")
+    )
+    setting == "dispatcher" && return true
+    setting == "worker" && return false
+    isempty(setting) || @warn "THREADTEAMS_SLOT_CLEARING should be `dispatcher` or `worker`, not `$setting`; using the default"
+    (arch === :x86_64 || arch === :i686) || return false
+    # LLVM's names of AMD's x86 CPUs, and generic targets (unknown vendor)
+    amd = ("znver", "bdver", "btver", "amdfam", "barcelona", "k8", "opteron", "athlon")
+    return !(any(p -> startswith(cpu, p), amd) || cpu == "generic" || startswith(cpu, "x86-64"))
+end
+
+# Computed once per process (`Base.OncePerProcess`, Julia >= 1.12); before, when a pool
+# starts, which happens once per process too unless the pool is shut down
+@static if isdefined(Base, :OncePerProcess)
+    const SLOT_CLEARING = Base.OncePerProcess{Bool}(dispatcher_clears_slots)
+else
+    const SLOT_CLEARING = dispatcher_clears_slots
+end
+
 # A slot for a chunk function of type `F` (`job_slot`, `worker_slots`): one element of a
 # `Memory{F}` (a `Vector{F}` on Julia 1.10) with a cache line of unused elements on each
 # side, since it is written in every region. Stored with a typed `setindex!` (so with the
@@ -437,11 +480,12 @@ function run_job_in_scope(pool::Pool, ws::WorkerState, k::Int, cmd::Int)
     return nothing
 end
 
-# Run chunk `chunk` from the worker's own slot and drop the chunk function from it
-# afterwards (when the chunk throws, the dispatcher does, see `dispatch!`)
+# Run chunk `chunk` from the worker's own slot, and empty the slot afterwards unless the
+# dispatcher does (`DISPATCHER_CLEARS`; when the chunk throws, the dispatcher does in any
+# case, see `dispatch!`)
 @inline function run_job_own(slot::Slot{F}, chunk::Int) where {F}
     run_chunk(slot, chunk)
-    clear_slot!(slot)
+    DISPATCHER_CLEARS[] || clear_slot!(slot)
     return nothing
 end
 
@@ -619,6 +663,8 @@ end
 end
 
 @noinline function new_pool()
+    # Before the workers start, which read it
+    DISPATCHER_CLEARS[] = SLOT_CLEARING()
     pool = Pool()
     @atomic :release POOL.pool = pool
     return pool
@@ -653,9 +699,10 @@ end
 end
 
 # The workers' slots for chunk functions of type `F` (`COPY_BYTES`): slot `k` is used by
-# worker `k` only, so it stays in that worker's cache. The vector is created once per type
-# like `job_slot`'s cache, and grown when a region first needs the slots (so an image
-# holds it empty).
+# worker `k` only. The dispatcher stores the chunk function; the worker or the dispatcher
+# empties the slot after the chunk, depending on the CPU (`DISPATCHER_CLEARS`). The vector
+# is created once per type like `job_slot`'s cache, and grown when a region first needs the
+# slots (so an image holds it empty).
 @generated function worker_slot_vector(::Type{F}) where {F}
     return :($(Slot{F}[]))
 end
@@ -843,9 +890,11 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
     # The workers' slots are used, and need to exist, only for a small `f` (`COPY_BYTES`)
     copies = own_slots(F)
     wslots = copies ? worker_slots(F, length(pool.workers)) : worker_slot_vector(F)
+    clears = copies && DISPATCHER_CLEARS[]
     base = cmd_base(n, skip, has_scope)
-    # Whether every worker of the region is idle (also when a chunk threw)
-    drained = false
+    # Whether every worker of the region is idle (also when a chunk threw), and whether the
+    # workers' slots are empty
+    drained = cleared = false
     try
         # Decreasing chunk order: see `wake_children`
         for chunk in n:-1:2
@@ -890,8 +939,8 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
         else
             steal_chunks(pool, slot, n, skip, base, wslots, copies)
         end
-        wait_workers(pool, 2, n, skip)
-        drained = true
+        wait_workers(pool, 2, n, skip, wslots, clears)
+        drained = cleared = true
         for chunk in 2:n
             k = worker_for_chunk(chunk, skip)
             err = @inbounds pool.errs[k]
@@ -908,11 +957,14 @@ function dispatch!(pool::Pool, f::F, n::Int) where {F}
         has_scope && (@atomic :monotonic pool.scope = nothing)
         for chunk in 2:n
             k = worker_for_chunk(chunk, skip)
+            # If the dispatcher empties the slots: emptied while waiting for the workers,
+            # else here
+            clears && !cleared && clear_slot!(@inbounds wslots[k])
             # A worker whose chunk threw, or that died with its command set
             # (`dead_worker_error`), left the chunk function in its slot
             if (@inbounds pool.errs[k]) !== nothing ||
                     (@atomic :monotonic (@inbounds pool.workers[k]).cmd) != 0
-                copies && clear_slot!(@inbounds wslots[k])
+                copies && !clears && clear_slot!(@inbounds wslots[k])
                 @inbounds pool.errs[k] = nothing
             end
         end
@@ -1005,10 +1057,20 @@ end
 # Wait until the workers of chunks `from:n` are idle. A dead worker is reported only once
 # the others have finished, since the region's slot and buffers are released afterwards.
 @inline function wait_workers(pool::Pool, from, n, skip)
+    return wait_workers(pool, from, n, skip, worker_slot_vector(Nothing), false)
+end
+# The same, emptying the slot of each worker (`copies`) as soon as the worker is idle: the
+# stores overlap the wait for the others, so that only the last worker's is on the
+# dispatcher's way out of the region (`worker_slot_vector`)
+@inline function wait_workers(pool::Pool, from, n, skip, wslots, copies::Bool)
     dead = 0
     for chunk in from:n
         k = worker_for_chunk(chunk, skip)
-        wait_idle(pool, k) || (dead = k)
+        if wait_idle(pool, k)
+            copies && clear_slot!(@inbounds wslots[k])
+        else
+            dead = k
+        end
     end
     dead == 0 || dead_worker_error(dead)
     return nothing
