@@ -1311,6 +1311,34 @@ end
     end
 end
 
+# Loops run serially during precompilation, so a workload never reaches the pool: compile
+# what the pool runs for a chunk function of type `F` instead
+# Not specialized: it would be compiled for every loop body, also outside precompilation
+@noinline function precompile_pool_path(@nospecialize(F::Type), @nospecialize(sched))
+    precompile(run_on_pool, (Pool, F, Int, typeof(sched)))
+    J = sched isa GreedyTeamScheduler ? GreedyJob{F} : F
+    precompile(dispatch!, (Pool, J, Int))
+    precompile(job_op, (SlotSet{J}, Int, Int, Int))
+    precompile(job_entry, (Type{J},))
+    return nothing
+end
+
+const PRECOMPILE_ONLY = ScopedValues.ScopedValue(false)
+
+"""
+    ThreadTeams.precompile_loop(f)
+
+Call `f()` during precompilation with the team loops it starts (`tforeach` and other loops
+without a result) compiled for the pool but not run: their chunk functions are not called. For precompile workloads whose loops can not
+run while precompiling (loops run serially then, so a plain workload never compiles the
+pool's code for its loop bodies). Outside of precompilation it does nothing.
+"""
+function precompile_loop(f)
+    generating_output() || return nothing
+    ScopedValues.with(f, PRECOMPILE_ONLY => true)
+    return nothing
+end
+
 """
     ThreadTeams.shutdown!()
 

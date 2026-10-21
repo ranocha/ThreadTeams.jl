@@ -108,10 +108,13 @@ worlds_ok(jobs, w) = all(job isa ThreadTeams.Job && job.world == w for job in jo
             using ThreadTeams
             fill_index!(x) = tforeach(i -> (x[i] = Float64(i)), eachindex(x); scheduler = TeamScheduler())
             sum_squares(x) = tmapreduce(abs2, +, x; scheduler = TeamScheduler())
+            never!(x) = tforeach(i -> error("chunk ran"), eachindex(x); scheduler = TeamScheduler())
             # Precompile workload (loops run serially during precompilation)
             let x = zeros(8)
                 fill_index!(x)
                 sum_squares(x)
+                # compiled, but its chunks do not run
+                ThreadTeams.precompile_loop(() -> never!(x))
             end
             end
             """
