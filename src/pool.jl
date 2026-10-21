@@ -217,9 +217,15 @@ end
 # line the worker wrote last, a transfer per worker in a row: skipping it makes loops of
 # trivial chunks 10-31% faster on an NVIDIA GB10 (Cortex-X925, 4-10 threads) and 6-15%
 # on an Apple M1, but on x86 it was slower (Ryzen 9 5950X: +16% with 8 threads; Cascade
-# Lake: +2-5%), where the load apparently brings the line ahead of the command store.
-# Set once per process from `trusts_seen_idle()` when the pool starts.
+# Lake: +2-5%). Set once per process from `trusts_seen_idle()` when the pool starts.
 const TRUST_SEEN_IDLE = Ref(false)
+# Whether the skip is compiled in at all: only on ARM, where it pays (on x86 the code
+# without it measured faster even with the check made at run time)
+const SKIPS_IDLE_CHECK = Sys.ARCH === :aarch64
+# Padding of `Pool.seen_idle` on each side, in elements (`Bool`s)
+const SEEN_PAD = CACHE_LINE
+@inline seen_idle(pool, k) = @inbounds pool.seen_idle[SEEN_PAD + k]
+@inline set_seen_idle!(pool, k, v::Bool) = (@inbounds pool.seen_idle[SEEN_PAD + k] = v; nothing)
 
 """
     ThreadTeams.trusts_seen_idle(arch = Sys.ARCH,
@@ -227,8 +233,10 @@ const TRUST_SEEN_IDLE = Ref(false)
 
 Whether the dispatcher hands a worker that the last region saw idle its next command
 without checking the worker's state first: `true` on ARM (`aarch64`), `false` elsewhere.
-The environment variable `THREADTEAMS_IDLE_CHECK` (`unseen`: check only the workers not
-seen idle; `always`) overrides it. Read once per process, when the pool starts.
+On ARM the environment variable `THREADTEAMS_IDLE_CHECK` (`unseen`: check only the workers
+not seen idle; `always`) overrides it; elsewhere the skip is not compiled in
+(`SKIPS_IDLE_CHECK`), and the check always runs. Read once per process, when the pool
+starts.
 """
 function trusts_seen_idle(
         arch::Symbol = Sys.ARCH,
@@ -341,10 +349,13 @@ mutable struct Pool
     # `failed` tells whether any is set
     const errs::Vector{Any}
     const failed::ErrorFlag
-    # `seen_idle[k]`: the last region saw worker `k` idle when it waited for it, so the next
-    # one need not check before handing it a command (`dispatch!`). Written and read only
-    # by the dispatcher (which holds `busy`); cleared when a command goes out and after a
-    # region that failed or was cut short (`clean_up_region`)
+    # `seen_idle[SEEN_PAD + k]`: the last region saw worker `k` idle when it waited for it,
+    # so the next one need not check before handing it a command (`dispatch!`). Written
+    # and read only by the dispatcher (which holds `busy`), and only where that pays
+    # (`TRUST_SEEN_IDLE`); cleared when a command goes out and after a region that failed
+    # or was cut short (`clean_up_region`). With a cache line of padding on each side: the
+    # small vector would otherwise share a line with whatever the allocator put next to it
+    # (unpadded, it cost about 30 ns per loop on a Ryzen 9 5950X)
     const seen_idle::Vector{Bool}
     # `tid2worker[tid]`: index of the worker running on thread `tid`, or `0`
     const tid2worker::Vector{Int}
@@ -653,7 +664,7 @@ function Pool()
     pool = Pool(
         nothing, [WorkerState() for _ in 1:nw],
         [Base.Event(true) for _ in 1:nw], Task[], Any[nothing for _ in 1:nw], ErrorFlag(),
-        zeros(Bool, nw), tid2worker, [SleepFlag() for _ in 1:nw], ChunkCounter(),
+        zeros(Bool, nw + 2 * SEEN_PAD), tid2worker, [SleepFlag() for _ in 1:nw], ChunkCounter(),
         Any[nothing for _ in 1:nw], zeros(Int, nw), is_oversubscribed(), 0
     )
     # A new task inherits its creator's dynamic scope. The workers get none, so they
@@ -940,7 +951,9 @@ end
     has_scope = scope !== nothing
     copies = own_slots(F)
     clears = copies && DISPATCHER_CLEARS[]
-    trust = TRUST_SEEN_IDLE[]
+    # A constant `false` off ARM, where the check always runs: the skip and its
+    # bookkeeping then compile away, and `dispatch!` is the same as with the check alone
+    trust = SKIPS_IDLE_CHECK && TRUST_SEEN_IDLE[]
     base = cmd_base(n, skip, has_scope)
     # Whether every worker of the region is idle (also when a chunk threw), and whether the
     # workers' slots are empty: both until the first command goes out. `stored`: whether
@@ -968,7 +981,7 @@ end
             # Normally idle (an interrupted region waits for its workers); detects a dead one.
             # Where it pays (`TRUST_SEEN_IDLE`), not checked if the last region saw the
             # worker idle: only the dispatcher sets a command, so the worker still is
-            if !(trust && @inbounds pool.seen_idle[k]) && !wait_idle(pool, k)
+            if !(trust && seen_idle(pool, k)) && !wait_idle(pool, k)
                 # Take back the chunks already handed out before giving up
                 cancel_chunks(pool, chunk + 1, n, skip, base, wslots, copies)
                 wait_workers(pool, chunk + 1, n, skip)
@@ -981,7 +994,7 @@ end
             # of `wake_children` (Dekker with the worker, which stores `sleeping` and loads
             # `cmd`). A wake-up still missed on a weakly ordered machine is repaired by the
             # re-notify of `wait_idle`; the region only takes longer.
-            @inbounds pool.seen_idle[k] = false
+            trust && set_seen_idle!(pool, k, false)
             ws = @inbounds pool.workers[k]
             copies && (@inbounds(wslots[k])[] = f)
             @atomic :monotonic ws.job = job
@@ -1000,7 +1013,7 @@ end
         else
             steal_chunks(pool, slot, n, skip, base, wslots, copies)
         end
-        wait_workers(pool, 2, n, skip, wslots, clears)
+        wait_workers(pool, 2, n, skip, wslots, clears, trust)
         drained = cleared = true
         # Relaxed: ordered by the acquire loads of the workers' `cmd = 0` (`wait_workers`)
         (@atomic :monotonic pool.failed.set) && throw_first_error(pool, n, skip)
@@ -1139,18 +1152,18 @@ end
 # Wait until the workers of chunks `from:n` are idle. A dead worker is reported only once
 # the others have finished, since the region's slot and buffers are released afterwards.
 @inline function wait_workers(pool::Pool, from, n, skip)
-    return wait_workers(pool, from, n, skip, worker_slot_vector(Nothing), false)
+    return wait_workers(pool, from, n, skip, worker_slot_vector(Nothing), false, false)
 end
 # The same, emptying the slot of each worker (`copies`) as soon as the worker is idle: the
 # stores overlap the wait for the others, so that only the last worker's is on the
 # dispatcher's way out of the region (`worker_slot_vector`)
-@inline function wait_workers(pool::Pool, from, n, skip, wslots, copies::Bool)
+@inline function wait_workers(pool::Pool, from, n, skip, wslots, copies::Bool, trust::Bool)
     dead = 0
     for chunk in from:n
         k = worker_for_chunk(chunk, skip)
         if wait_idle(pool, k)
             copies && clear_slot!(@inbounds wslots[k])
-            @inbounds pool.seen_idle[k] = true
+            trust && set_seen_idle!(pool, k, true)
         else
             dead = k
         end

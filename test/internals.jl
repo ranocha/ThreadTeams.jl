@@ -93,14 +93,24 @@ end
 # (`seen_idle`); a region that fails clears the flags, so that the next one checks again
 @testset "seen idle" begin
     if NW > 1
+        # (the flags are kept only where the check is skipped, which is compiled in only on
+        # ARM; the pool sets the setting when it starts, so start it first)
         tforeach(identity, 1:NW; scheduler = team)
-        pool = ThreadTeams.POOL.pool
-        @test count(pool.seen_idle) == NW - 1   # every worker but the caller's thread's
-        @test_throws ErrorException tforeach(i -> i == NW && error("chunk $i"), 1:NW; scheduler = team)
-        @test !any(pool.seen_idle)
-        @test all(isnothing, pool.errs) && !pool.failed.set
-        tforeach(identity, 1:NW; scheduler = team)
-        @test count(pool.seen_idle) == NW - 1
+        old = ThreadTeams.TRUST_SEEN_IDLE[]
+        ThreadTeams.TRUST_SEEN_IDLE[] = true
+        try
+            kept = ThreadTeams.SKIPS_IDLE_CHECK ? NW - 1 : 0   # every worker but the caller's thread's
+            tforeach(identity, 1:NW; scheduler = team)
+            pool = ThreadTeams.POOL.pool
+            @test count(pool.seen_idle) == kept
+            @test_throws ErrorException tforeach(i -> i == NW && error("chunk $i"), 1:NW; scheduler = team)
+            @test !any(pool.seen_idle)
+            @test all(isnothing, pool.errs) && !pool.failed.set
+            tforeach(identity, 1:NW; scheduler = team)
+            @test count(pool.seen_idle) == kept
+        finally
+            ThreadTeams.TRUST_SEEN_IDLE[] = old
+        end
         # chosen from the architecture, the environment variable overrides it
         @test ThreadTeams.trusts_seen_idle(:aarch64, "")
         @test !ThreadTeams.trusts_seen_idle(:x86_64, "")
